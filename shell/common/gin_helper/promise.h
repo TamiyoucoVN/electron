@@ -12,12 +12,10 @@
 #include <utility>
 
 #include "base/memory/raw_ptr.h"
-#include "content/public/browser/browser_task_traits.h"
-#include "content/public/browser/browser_thread.h"
+#include "base/memory/scoped_refptr.h"
+#include "base/task/task_runner.h"
 #include "shell/common/gin_converters/std_converter.h"
 #include "shell/common/gin_helper/locker.h"
-#include "shell/common/gin_helper/microtasks_scope.h"
-#include "shell/common/process_util.h"
 #include "v8/include/v8-context.h"
 
 namespace gin_helper {
@@ -50,9 +48,8 @@ class PromiseBase {
   // Promise<T> type.
   static void RejectPromise(PromiseBase&& promise,
                             const std::string_view errmsg) {
-    if (electron::IsBrowserProcess() &&
-        !content::BrowserThread::CurrentlyOn(content::BrowserThread::UI)) {
-      content::GetUIThreadTaskRunner({})->PostTask(
+    if (auto task_runner = GetTaskRunner()) {
+      task_runner->PostTask(
           FROM_HERE,
           base::BindOnce(
               // Note that this callback can not take std::string_view,
@@ -79,6 +76,10 @@ class PromiseBase {
  protected:
   v8::Local<v8::Promise::Resolver> GetInner() const;
 
+  v8::Maybe<bool> Resolve(v8::Local<v8::Value> except);
+
+  static scoped_refptr<base::TaskRunner> GetTaskRunner();
+
  private:
   raw_ptr<v8::Isolate> isolate_;
   v8::Global<v8::Context> context_;
@@ -93,9 +94,8 @@ class Promise : public PromiseBase {
 
   // Helper for resolving the promise with |result|.
   static void ResolvePromise(Promise<RT> promise, RT result) {
-    if (electron::IsBrowserProcess() &&
-        !content::BrowserThread::CurrentlyOn(content::BrowserThread::UI)) {
-      content::GetUIThreadTaskRunner({})->PostTask(
+    if (auto task_runner = GetTaskRunner()) {
+      task_runner->PostTask(
           FROM_HERE, base::BindOnce([](Promise<RT> promise,
                                        RT result) { promise.Resolve(result); },
                                     std::move(promise), std::move(result)));
@@ -118,18 +118,9 @@ class Promise : public PromiseBase {
     return Promise<NT>(isolate(), GetInner());
   }
 
-  // Promise resolution is a microtask
-  // We use the MicrotasksRunner to trigger the running of pending microtasks
   v8::Maybe<bool> Resolve(const RT& value) {
-    gin_helper::Locker locker(isolate());
-    v8::HandleScope handle_scope(isolate());
-    v8::Local<v8::Context> context = GetContext();
-    gin_helper::MicrotasksScope microtasks_scope{
-        isolate(), context->GetMicrotaskQueue(), false,
-        v8::MicrotasksScope::kRunMicrotasks};
-    v8::Context::Scope context_scope(context);
-
-    return GetInner()->Resolve(context, gin::ConvertToV8(isolate(), value));
+    v8::HandleScope handle_scope{isolate()};
+    return PromiseBase::Resolve(gin::ConvertToV8(isolate(), value));
   }
 
   template <typename... ResolveType>
